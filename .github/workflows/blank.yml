@@ -1,0 +1,113 @@
+from flask import Flask, request, jsonify
+from pytrends.request import TrendReq
+import requests
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+import re
+import time
+
+app = Flask(__name__)
+pytrends = TrendReq(hl='en-US', tz=360)
+
+@app.route('/api/search', methods=['GET'])
+def search():
+    keyword = request.args.get('keyword')
+    if not keyword:
+        return jsonify({"error": "Keyword is required."}), 400
+
+    # --- 1. Google Trends ---
+    try:
+        pytrends.build_payload([keyword], cat=100, timeframe='today 3-m', geo='US', gprop='')
+        interest = pytrends.interest_over_time()
+        trend_score = int(interest[keyword].mean()) if not interest.empty else 0
+    except Exception:
+        trend_score = 0
+
+    # --- 2. AliExpress ---
+    ali_url = f"https://www.aliexpress.com/wholesale?SearchText={keyword}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    ali_price = "N/A"
+    ali_sold = "N/A"
+    try:
+        ali_response = requests.get(ali_url, headers=headers, timeout=10)
+        ali_soup = BeautifulSoup(ali_response.text, 'html.parser')
+        price_tag = ali_soup.select_one(".manhattan--price-sale--1CCSZfK")
+        sold_tag = ali_soup.select_one(".manhattan--trade--2PeJIEw")
+        if price_tag:
+            ali_price = price_tag.get_text(strip=True)
+        if sold_tag:
+            ali_sold = sold_tag.get_text(strip=True)
+    except Exception:
+        pass
+
+    # --- 3. Amazon (Playwright) ---
+    amazon_price = "N/A"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(f"https://www.amazon.com/s?k={keyword}", timeout=60000)
+            page.wait_for_timeout(3000)
+            prices = page.query_selector_all("span.a-price > span.a-offscreen")
+            values = [float(p.inner_text().replace("$", "").replace(",", "")) for p in prices if p.inner_text().startswith("$")]
+            if values:
+                amazon_price = f"${max(values):.2f}"
+            browser.close()
+    except Exception:
+        pass
+
+    # --- 4. WatchCount ---
+    watchcount_data = []
+    try:
+        wc_url = f"https://www.watchcount.com/search.php?query={keyword}&catid=0&SortBy=MostWatched"
+        wc_response = requests.get(wc_url, headers=headers)
+        wc_soup = BeautifulSoup(wc_response.text, 'html.parser')
+        items = wc_soup.select(".resultitem")
+        for item in items[:5]:
+            title = item.select_one(".itemtitle")
+            watchers_match = re.search(r'(\d{3,}) watchers', item.text)
+            if title and watchers_match:
+                watchcount_data.append({
+                    "title": title.get_text(strip=True),
+                    "watchers": watchers_match.group(1)
+                })
+    except Exception:
+        pass
+
+    # --- 5. YouTube ---
+    youtube_data = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(f"https://www.youtube.com/results?search_query={keyword}", timeout=60000)
+            page.wait_for_timeout(3000)
+            content = page.content()
+            ids = re.findall(r'"videoId":"(.*?)"', content)
+            titles = re.findall(r'"title":\{"runs":\[\{"text":"(.*?)"\}\]', content)
+            views = re.findall(r'"viewCountText":\{"simpleText":"([\d,]+) views"\}', content)
+            for i in range(min(5, len(ids), len(titles), len(views))):
+                youtube_data.append({
+                    "title": titles[i],
+                    "views": views[i].replace(",", ""),
+                    "url": f"https://www.youtube.com/watch?v={ids[i]}"
+                })
+            browser.close()
+    except Exception:
+        pass
+
+    return jsonify({
+        "google_trends_score": trend_score,
+        "aliexpress": {
+            "lowest_price": ali_price,
+            "most_sold": ali_sold
+        },
+        "amazon": {
+            "highest_price": amazon_price
+        },
+        "watchcount": watchcount_data,
+        "youtube": youtube_data
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True)
